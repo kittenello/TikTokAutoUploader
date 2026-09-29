@@ -4,6 +4,7 @@ from phantomwright.user_simulator import SyncUserSimulator
 import json
 import time
 import subprocess
+import shutil
 from inference_sdk import InferenceHTTPClient
 import pkg_resources
 import requests
@@ -106,21 +107,41 @@ def install_js_dependencies():
     js_dir = pkg_resources.resource_filename(__name__, "Js_assets")
     node_modules_path = os.path.join(js_dir, "node_modules")
 
-    if not os.path.exists(node_modules_path):
-        print("JavaScript dependencies not found. Installing...")
-        try:
-            subprocess.run(["npm", "install", "--silent"], cwd=js_dir, check=True)
-        except Exception as e:
-            print("An error occurred during npm installation.")
-            print(f"Error details: {e}")
-            print("Trying to install JavaScript dependencies with shell...")
-            try:
-                subprocess.run(["npm", "install", "--silent"], cwd=js_dir, check=True, shell=True)
-            except Exception as e:
-                print("An error occurred during shell npm installation.")
-                print(f"Error details: {e}")
-    else:
+    if os.path.exists(node_modules_path):
         time.sleep(0.1)
+        return
+
+    print("JavaScript dependencies not found. Installing...")
+
+    # On Windows, npm is commonly exposed as npm.cmd instead of npm.exe.
+    # shutil.which() resolves the correct launcher from PATH on every platform.
+    npm_executable = (
+        shutil.which("npm")
+        or shutil.which("npm.cmd")
+        or shutil.which("npm.exe")
+    )
+
+    if not npm_executable:
+        raise TikTokUploadError(
+            "ERROR: NPM WAS NOT FOUND IN PATH. Install Node.js, reopen the terminal, "
+            "and make sure 'npm -v' works."
+        )
+
+    try:
+        subprocess.run(
+            [npm_executable, "install", "--silent"],
+            cwd=js_dir,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise TikTokUploadError(
+            f"ERROR: NPM INSTALL FAILED WITH EXIT CODE {e.returncode}. "
+            f"Try manually: cd \"{js_dir}\" && npm install"
+        )
+    except OSError as e:
+        raise TikTokUploadError(
+            f"ERROR: COULD NOT START NPM ({npm_executable}): {e}"
+        )
 
 
 def read_cookies(cookies_path):
