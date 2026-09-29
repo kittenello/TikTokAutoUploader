@@ -4,6 +4,7 @@ from phantomwright.user_simulator import SyncUserSimulator
 import json
 import time
 import subprocess
+import shutil
 from inference_sdk import InferenceHTTPClient
 import pkg_resources
 import requests
@@ -106,21 +107,41 @@ def install_js_dependencies():
     js_dir = pkg_resources.resource_filename(__name__, "Js_assets")
     node_modules_path = os.path.join(js_dir, "node_modules")
 
-    if not os.path.exists(node_modules_path):
-        print("JavaScript dependencies not found. Installing...")
-        try:
-            subprocess.run(["npm", "install", "--silent"], cwd=js_dir, check=True)
-        except Exception as e:
-            print("An error occurred during npm installation.")
-            print(f"Error details: {e}")
-            print("Trying to install JavaScript dependencies with shell...")
-            try:
-                subprocess.run(["npm", "install", "--silent"], cwd=js_dir, check=True, shell=True)
-            except Exception as e:
-                print("An error occurred during shell npm installation.")
-                print(f"Error details: {e}")
-    else:
+    if os.path.exists(node_modules_path):
         time.sleep(0.1)
+        return
+
+    print("JavaScript dependencies not found. Installing...")
+
+    # On Windows, npm is commonly exposed as npm.cmd instead of npm.exe.
+    # shutil.which() resolves the correct launcher from PATH on every platform.
+    npm_executable = (
+        shutil.which("npm")
+        or shutil.which("npm.cmd")
+        or shutil.which("npm.exe")
+    )
+
+    if not npm_executable:
+        raise TikTokUploadError(
+            "ERROR: NPM WAS NOT FOUND IN PATH. Install Node.js, reopen the terminal, "
+            "and make sure 'npm -v' works."
+        )
+
+    try:
+        subprocess.run(
+            [npm_executable, "install", "--silent"],
+            cwd=js_dir,
+            check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        raise TikTokUploadError(
+            f"ERROR: NPM INSTALL FAILED WITH EXIT CODE {e.returncode}. "
+            f"Try manually: cd \"{js_dir}\" && npm install"
+        )
+    except OSError as e:
+        raise TikTokUploadError(
+            f"ERROR: COULD NOT START NPM ({npm_executable}): {e}"
+        )
 
 
 def read_cookies(cookies_path):
@@ -671,6 +692,300 @@ def _set_video_input(page, video):
         )
 
 
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif"}
+MAX_PHOTOS_PER_POST = 35
+
+
+def _normalize_photo_paths(photos):
+    """Validate and normalize a TikTok photo carousel."""
+    if isinstance(photos, (str, os.PathLike)):
+        photos = [photos]
+
+    if photos is None:
+        raise TikTokUploadError("ERROR: PLEASE PROVIDE AT LEAST ONE PHOTO")
+
+    photo_paths = [os.path.abspath(os.fspath(photo)) for photo in photos]
+
+    if not photo_paths:
+        raise TikTokUploadError("ERROR: PLEASE PROVIDE AT LEAST ONE PHOTO")
+    if len(photo_paths) > MAX_PHOTOS_PER_POST:
+        raise TikTokUploadError(
+            f"ERROR: TIKTOK PHOTO POSTS SUPPORT AT MOST {MAX_PHOTOS_PER_POST} PHOTOS"
+        )
+
+    for photo in photo_paths:
+        if not os.path.isfile(photo):
+            raise TikTokUploadError(f"ERROR: PHOTO FILE NOT FOUND: {photo}")
+        extension = os.path.splitext(photo)[1].lower()
+        if extension not in PHOTO_EXTENSIONS:
+            raise TikTokUploadError(
+                f"ERROR: UNSUPPORTED PHOTO FORMAT '{extension}' FOR {photo}. "
+                f"SUPPORTED: {', '.join(sorted(PHOTO_EXTENSIONS))}"
+            )
+
+    return photo_paths
+
+
+def _visible_first(page, selectors):
+    """Return the first visible locator for a selector list, or None."""
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0 and locator.is_visible():
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+def _click_photo_mode(page):
+    """Switch TikTok Studio's upload surface from video to Photo Mode when needed."""
+    selectors = [
+        '[role="tab"]:has-text("Photo")',
+        'button:has-text("Photo")',
+        'button:has-text("Upload photo")',
+        'button:has-text("Upload photos")',
+        'div[role="tab"]:has-text("Photo")',
+    ]
+
+    target = _visible_first(page, selectors)
+    if target is None:
+        return False
+
+    try:
+        target.click(timeout=5000)
+        time.sleep(0.75)
+        return True
+    except Exception:
+        return False
+
+
+def _find_photo_input(page):
+    selectors = [
+        'input[type="file"][accept*="image"][multiple]',
+        'input[type="file"][multiple][accept*="image"]',
+        'input[type="file"][accept*="image"]',
+        'input[type="file"][multiple]:not([accept*="video"])',
+    ]
+
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0:
+                return locator
+        except Exception:
+            continue
+    return None
+
+
+def _set_photo_input(page, photos):
+    """Attach all photos in one chooser operation so TikTok preserves their order."""
+    photo_paths = _normalize_photo_paths(photos)
+
+    photo_input = _find_photo_input(page)
+    if photo_input is None:
+        _click_photo_mode(page)
+        time.sleep(0.5)
+        photo_input = _find_photo_input(page)
+
+    if photo_input is not None:
+        try:
+            photo_input.set_input_files(photo_paths)
+            return photo_paths
+        except Exception:
+            pass
+
+    # Some TikTok Studio builds only create the file input after the button is clicked.
+    chooser_buttons = [
+        'button:has-text("Select photos")',
+        'button:has-text("Select photo")',
+        'button:has-text("Upload photos")',
+        'button:has-text("Upload photo")',
+        'button[aria-label*="photo" i]',
+    ]
+
+    for selector in chooser_buttons:
+        try:
+            button = page.locator(selector).first
+            if button.count() == 0 or not button.is_visible():
+                continue
+            with page.expect_file_chooser(timeout=5000) as chooser_info:
+                button.click()
+            chooser_info.value.set_files(photo_paths)
+            return photo_paths
+        except Exception:
+            continue
+
+    raise TikTokUploadError(
+        "ERROR: FAILED TO FIND TIKTOK PHOTO UPLOAD INPUT. "
+        "Run with headless=False and make sure Photo Mode is available for this account."
+    )
+
+
+def _find_caption_box(page, timeout_seconds=120):
+    selectors = [
+        'div[data-contents="true"]',
+        '[contenteditable="true"][role="textbox"]',
+        'div[contenteditable="true"]',
+    ]
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        target = _visible_first(page, selectors)
+        if target is not None:
+            return target
+        time.sleep(0.25)
+
+    raise TikTokUploadError(
+        "ERROR: TIKTOK PHOTO EDITOR DID NOT BECOME READY (CAPTION BOX NOT FOUND)"
+    )
+
+
+def _dismiss_upload_tutorials(page, suppressprint=False):
+    for label in ("Cancel", "Got it"):
+        try:
+            button = page.locator(f'button:has-text("{label}")').first
+            if button.count() > 0 and button.is_visible():
+                if not suppressprint:
+                    print(f"Tutorial pop-up detected, clicking '{label}'")
+                button.click()
+                time.sleep(0.2)
+        except Exception:
+            continue
+
+
+def _add_photo_description_and_hashtags(
+    page,
+    sim,
+    description,
+    hashtags,
+    stealth,
+    suppressprint,
+):
+    desc_box = _find_caption_box(page)
+    _dismiss_upload_tutorials(page, suppressprint=suppressprint)
+
+    sim.click(desc_box)
+    # TikTok may prefill the field with a filename. Clearing the whole editor is
+    # more reliable for photo posts than guessing the filename length.
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Backspace")
+    time.sleep(0.2)
+
+    if description is None:
+        raise TikTokUploadError("ERROR: PLEASE INCLUDE A DESCRIPTION")
+
+    if description:
+        sim.type(desc_box, description)
+
+    if hashtags is not None:
+        for hashtag in hashtags:
+            if not hashtag:
+                continue
+            if hashtag[0] != "#":
+                hashtag = "#" + hashtag
+
+            page.keyboard.type(hashtag)
+            time.sleep(0.5)
+            try:
+                if stealth:
+                    time.sleep(2)
+                page.click(f'span.hash-tag-topic:has-text("{hashtag}")', timeout=1000)
+            except Exception:
+                try:
+                    page.click("span.hash-tag-topic", timeout=1000)
+                except Exception:
+                    # Keep the hashtag as plain caption text if TikTok does not
+                    # render its autocomplete list on this account/build.
+                    page.keyboard.type(" ")
+
+    if not suppressprint:
+        print("Photo description and hashtags added")
+
+
+def _wait_for_photo_upload_ready(page):
+    """Wait until TikTok enables a Post button after processing all photos."""
+    selectors = [
+        'button[data-e2e="post_photo_button"][aria-disabled="false"]',
+        'button[data-e2e="post_video_button"][aria-disabled="false"]',
+        'button:has-text("Post")[aria-disabled="false"]',
+        'button:has-text("Post"):not([disabled])',
+    ]
+
+    deadline = time.time() + 1200
+    while time.time() < deadline:
+        if _visible_first(page, selectors) is not None:
+            return
+        time.sleep(0.5)
+
+    raise TikTokUploadError(
+        "ERROR: TIKTOK TOOK TOO LONG TO PROCESS THE PHOTO CAROUSEL (>20min)"
+    )
+
+
+def _submit_photo_upload(page, stealth, suppressprint):
+    """Publish a Photo Mode post and verify that TikTok accepted the action."""
+    if stealth:
+        time.sleep(1)
+
+    post_selectors = [
+        'button[data-e2e="post_photo_button"]',
+        'button[data-e2e="post_video_button"]',
+        'button:has-text("Post")[aria-disabled="false"]',
+        'button:has-text("Post"):not([disabled])',
+    ]
+    post_button = _visible_first(page, post_selectors)
+    if post_button is None:
+        raise TikTokUploadError("ERROR: PHOTO POST BUTTON NOT FOUND")
+
+    try:
+        post_button.click(timeout=5000)
+    except Exception as exc:
+        raise TikTokUploadError(f"ERROR: FAILED TO CLICK PHOTO POST BUTTON: {exc}")
+
+    try:
+        confirm = page.locator('button:has-text("Post now")').first
+        if confirm.count() > 0 and confirm.is_visible():
+            confirm.click(timeout=3000)
+    except Exception:
+        pass
+
+    # TikTok can either redirect to the content page or show an upload-in-progress
+    # notice before the redirect. Accept either as a successful submit signal.
+    submitted = False
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        try:
+            current_url = page.url
+            if current_url.startswith(CONTENT_URL) and "/upload" not in current_url:
+                submitted = True
+                break
+        except Exception:
+            pass
+
+        try:
+            if page.locator(':has-text("Leaving the page does not interrupt")').first.is_visible():
+                submitted = True
+                break
+        except Exception:
+            pass
+
+        time.sleep(0.25)
+
+    if not suppressprint:
+        if submitted:
+            print("Done uploading photo carousel")
+        else:
+            print(
+                "POSSIBLE ERROR: TikTok did not show a success signal. "
+                "Check the account before retrying to avoid a duplicate post."
+            )
+
+    time.sleep(1)
+    page.close()
+    return None if submitted else "Error"
+
+
 def _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint):
     page.wait_for_selector('div[data-contents="true"]')
 
@@ -693,9 +1008,9 @@ def _add_description_and_hashtags(page, sim, video, description, hashtags, steal
     if description is None:
         raise TikTokUploadError("ERROR: PLEASE INCLUDE A DESCRIPTION")
 
-    for _ in range(len(video) + 2):
-        page.keyboard.press("Backspace")
-        page.keyboard.press("Delete")
+    # Clear any TikTok-prefilled filename/caption in one operation.
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Backspace")
 
     time.sleep(0.5)
     sim.type(desc_box, description)
@@ -1321,3 +1636,159 @@ def upload_tiktok(
 
 
     return "Completed"
+
+
+def login_tiktok_account(accountname: str, *, proxy=None) -> str:
+    """Create or refresh the saved cookie file for one TikTok account.
+
+    `accountname` is a local label used in the cookie filename. On first use a
+    visible browser opens; log in to the TikTok account you want associated with
+    that label. The browser closes automatically after TikTok reaches /foryou.
+    """
+    if not accountname:
+        raise TikTokUploadError("PLEASE ENTER NAME OF ACCOUNT TO LOG IN")
+
+    try:
+        validate_proxy(proxy)
+    except Exception as e:
+        raise TikTokUploadError(f"Error validating proxy: {e}")
+
+    _load_or_create_cookies(accountname, proxy)
+    cookie_path = _cookie_file(accountname)
+    print(f"Account '{accountname}' is ready. Cookies saved to {cookie_path}")
+    return cookie_path
+
+
+def upload_tiktok_photos(
+    photos,
+    description: str,
+    accountname: str,
+    *,
+    hashtags=None,
+    suppressprint: bool = False,
+    headless: bool = True,
+    stealth: bool = False,
+    proxy=None,
+    visibility: str = "everyone",
+) -> str:
+    """Upload a TikTok Photo Mode carousel using local image files.
+
+    `photos` is an ordered list of 1..35 image paths. The same cookie/login
+    mechanism used by `upload_tiktok` is reused, so video and photo uploads can
+    share account labels.
+    """
+    photo_paths = _normalize_photo_paths(photos)
+
+    try:
+        check_for_updates()
+    except Exception:
+        time.sleep(0.1)
+
+    try:
+        validate_proxy(proxy)
+    except Exception as e:
+        raise TikTokUploadError(f"Error validating proxy: {e}")
+
+    if accountname is None:
+        raise TikTokUploadError(
+            "PLEASE ENTER NAME OF ACCOUNT TO POST ON, READ DOCUMENTATION FOR MORE INFO"
+        )
+
+    cookies = _load_or_create_cookies(accountname, proxy)
+
+    with sync_playwright() as p:
+        _, context = _make_stealth_context(p, headless=headless, proxy=proxy)
+        context.add_cookies(cookies)
+        page = context.new_page()
+        sim = SyncUserSimulator(page)
+
+        if not suppressprint:
+            print(
+                f"Uploading {len(photo_paths)} photo(s) to account '{accountname}'"
+            )
+
+        _goto_with_retry(page, UPLOAD_URL)
+        sim.simulate_browsing(duration_ms=1500)
+
+        captcha = _wait_for_upload_or_captcha(page)
+        if captcha:
+            _solve_captcha_if_needed(page, suppressprint)
+
+        _set_photo_input(page, photo_paths)
+        _add_photo_description_and_hashtags(
+            page,
+            sim,
+            description,
+            hashtags,
+            stealth,
+            suppressprint,
+        )
+        _wait_for_photo_upload_ready(page)
+
+        if not suppressprint:
+            print("TikTok finished processing the photo carousel")
+
+        if visibility and visibility.lower() != "everyone":
+            _set_visibility(page, visibility, suppressprint)
+
+        sim.simulate_browsing(duration_ms=750)
+
+        result = _submit_photo_upload(page, stealth, suppressprint)
+        if result == "Error":
+            return "Error"
+
+    return "Completed"
+
+
+def upload_tiktok_photos_multi(
+    photos,
+    description: str,
+    accountnames,
+    *,
+    hashtags=None,
+    suppressprint: bool = False,
+    headless: bool = True,
+    stealth: bool = False,
+    proxy=None,
+    visibility: str = "everyone",
+    continue_on_error: bool = True,
+):
+    """Upload the same ordered photo carousel to multiple account labels.
+
+    Accounts are processed sequentially. The return value maps every account
+    label to either "Completed", "Error", or an "Error: ..." message.
+    """
+    if isinstance(accountnames, str):
+        accountnames = [accountnames]
+
+    accountnames = list(accountnames or [])
+    if not accountnames:
+        raise TikTokUploadError("ERROR: PLEASE PROVIDE AT LEAST ONE ACCOUNT")
+
+    # Validate once before opening any browser so a bad file list cannot result in
+    # a partial multi-account publish.
+    photo_paths = _normalize_photo_paths(photos)
+    results = {}
+
+    for accountname in accountnames:
+        try:
+            results[accountname] = upload_tiktok_photos(
+                photos=photo_paths,
+                description=description,
+                accountname=accountname,
+                hashtags=hashtags,
+                suppressprint=suppressprint,
+                headless=headless,
+                stealth=stealth,
+                proxy=proxy,
+                visibility=visibility,
+            )
+        except Exception as exc:
+            results[accountname] = f"Error: {exc}"
+            if not suppressprint:
+                print(f"Upload failed for account '{accountname}': {exc}")
+            if not continue_on_error:
+                raise
+
+    return results
+

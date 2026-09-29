@@ -3,3 +3,5 @@
 /dist
 /tiktokautouploader.egg-info
 .history
+TK_cookies*.json
+captcha_image.jpg

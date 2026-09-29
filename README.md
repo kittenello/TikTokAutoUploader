@@ -19,6 +19,7 @@
 - **Add Working Hashtags:** Hashtags that are clickable and actually show up as hashtags instead of text.
 - **Proxy Support:** Route your uploads through a proxy server of your choice.
 - **Multiple Accounts:** Handle as many TikTok accounts as you need without losing track of any of them.
+- **Photo Mode / Carousels:** Upload ordered photo posts (for example 9-slide carousels) and reuse the same carousel across multiple accounts.
 - **Telegram Integration:** Hook the uploader up to a Telegram bot. Check `/TelegramAutomation` for setup details.
 - **Phantomwright Stealth Engine:** Bot detection evasion baked in at the browser level — fingerprint spoofing, human-like interactions, and hardened browser flags out of the box.
 
@@ -57,6 +58,79 @@ phantomwright_driver install chromium
 > It's worth reading `DOCUMENTATION.md` before diving in. The first time you use the function for an account you'll be asked to log in — this only happens once per account.
 
 NOTE: The first time you run the function, it may take a long while to run as JS libraries are built, this only occurs on first run
+
+### Photo carousel quick start (Windows)
+
+This fork adds a small helper script so you do not need to edit Python every time.
+
+1. Clone this fork and install it in editable mode:
+
+```powershell
+git clone https://github.com/kittenello/TikTokAutoUploader.git
+cd TikTokAutoUploader
+git checkout feat/photo-carousel-multi-account
+py -m pip install -e .
+phantomwright_driver install chromium
+```
+
+Node.js must also be installed and `node` / `npm` must be available in PATH.
+
+2. Log in to each TikTok account once. The words `main`, `backup`, etc. are only local labels; choose any names you like:
+
+```powershell
+py photo_uploader.py login main backup
+```
+
+A visible TikTok login window opens for each new account. Log in normally. After TikTok reaches the For You page, the script stores separate local cookie files such as `TK_cookies_main.json` and `TK_cookies_backup.json`. These files are ignored by Git and should never be committed or shared.
+
+3. Put one carousel into a folder. File names control the order. For example:
+
+```text
+photos/
+  01.jpg
+  02.jpg
+  03.jpg
+  04.jpg
+  05.jpg
+  06.jpg
+  07.jpg
+  08.jpg
+  09.jpg
+```
+
+4. Upload the same carousel to several accounts:
+
+```powershell
+py photo_uploader.py photos .\photos --accounts main backup --caption "my caption" --hashtags fyp photos --visible-browser
+```
+
+For the first test, keep `--visible-browser` so you can see TikTok Studio. Once your account/UI works correctly you can omit it for headless mode.
+
+Supported photo extensions: JPG/JPEG, PNG, WebP, HEIC and HEIF. The library accepts 1-35 images per post.
+
+You can also call the Python API directly:
+
+```python
+from tiktokautouploader import upload_tiktok_photos, upload_tiktok_photos_multi
+
+upload_tiktok_photos(
+    photos=["01.jpg", "02.jpg", "03.jpg"],
+    description="One account",
+    accountname="main",
+    hashtags=["fyp", "photos"],
+    headless=False,
+)
+
+results = upload_tiktok_photos_multi(
+    photos=["01.jpg", "02.jpg", "03.jpg"],
+    description="Same carousel on several accounts",
+    accountnames=["main", "backup"],
+    headless=False,
+)
+print(results)
+```
+
+> TikTok changes TikTok Studio markup frequently. Photo upload uses multiple selector fallbacks, but if TikTok changes the page, run with `--visible-browser` and update the selectors in `tiktokautouploader/function.py`.
 
 ### Upload with hashtags
 
