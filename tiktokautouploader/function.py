@@ -842,16 +842,56 @@ def _find_caption_box(page, timeout_seconds=120):
 
 
 def _dismiss_upload_tutorials(page, suppressprint=False):
-    for label in ("Cancel", "Got it"):
-        try:
-            button = page.locator(f'button:has-text("{label}")').first
-            if button.count() > 0 and button.is_visible():
+    """Dismiss TikTok Studio tutorial/onboarding pop-ups without blocking uploads.
+
+    TikTok sometimes renders a floating portal above the tutorial buttons. In
+    that state a normal Playwright click can wait for 30 seconds and fail with
+    "subtree intercepts pointer events". Try a short normal click first, then a
+    forced click, and finally a DOM click so one account cannot stall the whole
+    upload sequence.
+    """
+    labels = ("Cancel", "Got it", "Not now", "Skip", "Maybe later")
+
+    for _ in range(3):
+        found_any = False
+
+        for label in labels:
+            try:
+                button = page.locator(f'button:has-text("{label}")').first
+                if button.count() == 0 or not button.is_visible():
+                    continue
+
+                found_any = True
                 if not suppressprint:
-                    print(f"Tutorial pop-up detected, clicking '{label}'")
-                button.click()
-                time.sleep(0.2)
-        except Exception:
-            continue
+                    print(f"Tutorial pop-up detected, dismissing '{label}'...")
+
+                try:
+                    button.click(timeout=1500)
+                except Exception:
+                    try:
+                        button.click(timeout=1500, force=True)
+                    except Exception:
+                        try:
+                            button.evaluate("(el) => el.click()")
+                        except Exception:
+                            continue
+
+                time.sleep(0.25)
+            except Exception:
+                continue
+
+        if not found_any:
+            break
+
+        # Give TikTok's floating portal a moment to unmount before checking again.
+        time.sleep(0.25)
+
+    # Escape is a harmless final fallback for transient floating-ui portals.
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.1)
+    except Exception:
+        pass
 
 
 def _add_photo_description_and_hashtags(
@@ -990,11 +1030,7 @@ def _add_description_and_hashtags(page, sim, video, description, hashtags, steal
     page.wait_for_selector('div[data-contents="true"]')
 
     time.sleep(0.5)
-    if page.locator("button:has-text('Cancel')").is_visible():
-        print("Tutorial pop-up detected, dismissing...")
-        page.click("button:has-text('Cancel')")
-    if page.locator("button:has-text('Got it')").is_visible():
-        page.click("button:has-text('Got it')")
+    _dismiss_upload_tutorials(page, suppressprint=suppressprint)
 
     desc_box = page.locator('div[data-contents="true"]')
     sim.click(desc_box)
