@@ -842,20 +842,24 @@ def _find_caption_box(page, timeout_seconds=120):
 
 
 def _dismiss_upload_tutorials(page, suppressprint=False):
-    """Dismiss TikTok Studio tutorial/onboarding pop-ups without blocking uploads.
+    """Dismiss TikTok Studio tutorial/onboarding pop-ups without touching CAPTCHA.
 
-    TikTok sometimes renders a floating portal above the tutorial buttons. In
-    that state a normal Playwright click can wait for 30 seconds and fail with
-    "subtree intercepts pointer events". Try a short normal click first, then a
-    forced click, and finally a DOM click so one account cannot stall the whole
-    upload sequence.
+    TikTok can mount its human-verification challenge inside the same floating-ui
+    portal used by tutorials. Never press Escape or force-click tutorial controls
+    while that verification modal is visible.
     """
     labels = ("Cancel", "Got it", "Not now", "Skip", "Maybe later")
 
     for _ in range(3):
+        if _verification_modal_visible(page):
+            return
+
         found_any = False
 
         for label in labels:
+            if _verification_modal_visible(page):
+                return
+
             try:
                 button = page.locator(f'button:has-text("{label}")').first
                 if button.count() == 0 or not button.is_visible():
@@ -883,15 +887,16 @@ def _dismiss_upload_tutorials(page, suppressprint=False):
         if not found_any:
             break
 
-        # Give TikTok's floating portal a moment to unmount before checking again.
         time.sleep(0.25)
 
-    # Escape is a harmless final fallback for transient floating-ui portals.
-    try:
-        page.keyboard.press("Escape")
-        time.sleep(0.1)
-    except Exception:
-        pass
+    # Only use Escape for transient tutorial overlays. Never send it while
+    # TikTok's human-verification modal is present.
+    if not _verification_modal_visible(page):
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.1)
+        except Exception:
+            pass
 
 
 def _add_photo_description_and_hashtags(
@@ -1084,6 +1089,14 @@ def _add_description_and_hashtags(page, sim, video, description, hashtags, steal
     page.wait_for_selector('div[data-contents="true"]')
 
     time.sleep(0.5)
+
+    # TikTok may show verification either before or immediately after its
+    # tutorial overlays. Check both sides and never dismiss the challenge.
+    _wait_for_manual_verification(
+        page,
+        headless=headless,
+        suppressprint=suppressprint,
+    )
     _dismiss_upload_tutorials(page, suppressprint=suppressprint)
     _wait_for_manual_verification(
         page,
