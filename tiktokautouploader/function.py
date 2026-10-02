@@ -1026,11 +1026,70 @@ def _submit_photo_upload(page, stealth, suppressprint):
     return None if submitted else "Error"
 
 
-def _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint):
+def _verification_modal_visible(page):
+    """Return True when TikTok is showing its human-verification modal."""
+    selectors = [
+        'img[alt*="Verify that you" i]',
+        'div.TUXModal-overlay[data-transition-status="open"]',
+        '[data-floating-ui-portal] img[alt*="robot" i]',
+    ]
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0 and locator.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _wait_for_manual_verification(page, headless, suppressprint=False, timeout_seconds=300):
+    """Handle TikTok human verification without attempting to bypass it.
+
+    In headless mode the verification cannot be completed interactively, so fail
+    immediately with a clear message. In visible mode, wait for the user to
+    complete the challenge manually and continue once the modal disappears.
+    """
+    if not _verification_modal_visible(page):
+        return
+
+    if headless:
+        raise TikTokUploadError(
+            "TIKTOK HUMAN VERIFICATION DETECTED. Re-run this account with "
+            "headless=False, complete the verification manually in the browser, "
+            "and the upload will continue automatically."
+        )
+
+    if not suppressprint:
+        print(
+            "TikTok human verification detected. Complete it manually in the "
+            "browser; upload will continue automatically."
+        )
+
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not _verification_modal_visible(page):
+            time.sleep(0.5)
+            if not suppressprint:
+                print("Verification completed, continuing upload...")
+            return
+        time.sleep(0.5)
+
+    raise TikTokUploadError(
+        "TIKTOK HUMAN VERIFICATION WAS NOT COMPLETED WITHIN 5 MINUTES."
+    )
+
+
+def _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint, headless=True):
     page.wait_for_selector('div[data-contents="true"]')
 
     time.sleep(0.5)
     _dismiss_upload_tutorials(page, suppressprint=suppressprint)
+    _wait_for_manual_verification(
+        page,
+        headless=headless,
+        suppressprint=suppressprint,
+    )
 
     desc_box = page.locator('div[data-contents="true"]')
     sim.click(desc_box)
@@ -1613,7 +1672,7 @@ def upload_tiktok(
             _solve_captcha_if_needed(page, suppressprint)
 
         _set_video_input(page, video)
-        _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint)
+        _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint, headless=headless)
         _wait_for_upload_ready(page)
 
         time.sleep(0.2)
