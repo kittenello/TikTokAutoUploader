@@ -13,6 +13,7 @@ from pathlib import Path
 from tiktokautouploader import (
     TikTokUploadError,
     login_tiktok_account,
+    login_tiktok_browser_profile,
     upload_tiktok,
     upload_tiktok_photos_multi,
 )
@@ -45,7 +46,7 @@ def collect_photos(folder: str):
 def cmd_login(args):
     for account in args.accounts:
         print(f"\n=== Login: {account} ===")
-        login_tiktok_account(account)
+        login_tiktok_browser_profile(account)
 
 
 def cmd_photos(args):
@@ -109,7 +110,7 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    login = sub.add_parser("login", help="Log in and save cookies for one or more account labels.")
+    login = sub.add_parser("login", help="Log in manually using a persistent Chrome profile for each account.")
     login.add_argument("accounts", nargs="+", help="Local account labels, e.g. main backup")
     login.set_defaults(func=cmd_login)
 
