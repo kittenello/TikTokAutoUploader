@@ -349,32 +349,70 @@ def validate_proxy(proxy):
         raise ValueError(f"Invalid proxy configuration when trying to simple request: {e}")
 
 
-def _make_stealth_context(p, headless, proxy):
-    stealth = Stealth(
-        navigator_languages_override=("en-US", "en"),
-    )
+def _make_stealth_context(p, headless, proxy, accountname=None):
+    """Create a stable browser context for TikTok.
+
+    For account uploads we use a persistent per-account Chrome profile. This keeps
+    TikTok device/session storage stable between runs instead of creating a fresh
+    browser fingerprint every time and only injecting cookies.
+
+    We deliberately do not spoof a fixed Chrome version or timezone here. The
+    browser reports its real values, which avoids obvious mismatches such as a
+    modern Chromium binary claiming to be Chrome 124 in America/New_York.
+    """
+    stealth = Stealth()
+
+    launch_args = [
+        "--no-sandbox",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+    ]
+
+    if accountname:
+        safe_account = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_"
+            for ch in str(accountname)
+        )
+        profile_dir = os.path.abspath(
+            os.path.join(".tiktok_profiles", safe_account)
+        )
+        os.makedirs(profile_dir, exist_ok=True)
+
+        persistent_kwargs = {
+            "user_data_dir": profile_dir,
+            "headless": headless,
+            "proxy": proxy,
+            "args": launch_args,
+            "viewport": {"width": 1280, "height": 900},
+        }
+
+        # Prefer the user's installed Chrome. It tends to behave more reliably
+        # with TikTok's human-verification widget than an isolated bundled build.
+        try:
+            context = p.chromium.launch_persistent_context(
+                channel="chrome",
+                **persistent_kwargs,
+            )
+        except Exception as chrome_error:
+            print(
+                "Installed Chrome could not be used; falling back to bundled "
+                f"Chromium ({chrome_error})"
+            )
+            context = p.chromium.launch_persistent_context(
+                **persistent_kwargs,
+            )
+
+        stealth.apply_stealth_sync(context)
+        return context.browser, context
 
     browser = p.chromium.launch(
         headless=headless,
         proxy=proxy,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-infobars",
-            "--disable-dev-shm-usage",
-        ],
+        args=launch_args,
     )
     context = browser.new_context(
         viewport={"width": 1280, "height": 900},
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        locale="en-US",
-        timezone_id="America/New_York",
     )
-
     stealth.apply_stealth_sync(context)
     return browser, context
 
@@ -1754,7 +1792,12 @@ def upload_tiktok(
     cookies = _load_or_create_cookies(accountname, proxy)
 
     with sync_playwright() as p:
-        _, context = _make_stealth_context(p, headless=headless, proxy=proxy)
+        _, context = _make_stealth_context(
+            p,
+            headless=headless,
+            proxy=proxy,
+            accountname=accountname,
+        )
         context.add_cookies(cookies)
         page = context.new_page()
 
@@ -1951,7 +1994,12 @@ def upload_tiktok_photos(
     cookies = _load_or_create_cookies(accountname, proxy)
 
     with sync_playwright() as p:
-        _, context = _make_stealth_context(p, headless=headless, proxy=proxy)
+        _, context = _make_stealth_context(
+            p,
+            headless=headless,
+            proxy=proxy,
+            accountname=accountname,
+        )
         context.add_cookies(cookies)
         page = context.new_page()
         sim = SyncUserSimulator(page)
