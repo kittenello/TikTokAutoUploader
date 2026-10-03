@@ -91,3 +91,27 @@ py photo_uploader.py video .\video.mp4 --accounts acc6 --caption "релиз в 
 получился сломанным, закрой все окна Chrome, удали только:
 .tiktok_profiles\acc6
 и запусти acc6 ещё раз. Cookie-файл TK_cookies_acc6.json оставь.
+
+
+ВАЖНО: НОВАЯ СХЕМА ЛОГИНА БЕЗ COOKIE JSON
+==========================================
+Для проблемных аккаунтов теперь НЕ используй старые TK_cookies_acc6.json / acc7.json.
+
+1. Закрой все окна Chrome.
+2. Удали старые профили:
+   rmdir /s /q .tiktok_profiles\acc6
+   rmdir /s /q .tiktok_profiles\acc7
+3. Удали старые cookie-файлы этих двух аккаунтов:
+   del TK_cookies_acc6.json
+   del TK_cookies_acc7.json
+4. Выполни:
+   py photo_uploader.py login acc6 acc7
+5. Для каждого аккаунта откроется отдельный обычный Google Chrome.
+   Войди вручную и пройди verification, если TikTok её покажет.
+   Скрипт сам закроет окно после обнаружения успешной сессии.
+6. После этого загружай:
+   py photo_uploader.py video .\video.mp4 --accounts acc6 acc7 --caption "релиз в тг t.me/donutgram" --hashtags iphone ayugram рек ayugramios --sound "ДИНАСТИЯ - VILLIAN & madk1d" --sound-volume mix --visible-browser
+
+После такого login загрузчик видит .profile_ready в профиле и вообще не импортирует
+TK_cookies_accN.json. Cookies + localStorage + IndexedDB + device/session state
+остаются внутри одного и того же Chrome-профиля.
