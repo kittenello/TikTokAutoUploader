@@ -1032,12 +1032,16 @@ def _submit_photo_upload(page, stealth, suppressprint):
 
 
 def _verification_modal_visible(page):
-    """Return True when TikTok is showing its human-verification modal."""
+    """Return True only for TikTok's actual human-verification challenge."""
     selectors = [
         'img[alt*="Verify that you" i]',
-        'div.TUXModal-overlay[data-transition-status="open"]',
+        'img[alt*="not a robot" i]',
         '[data-floating-ui-portal] img[alt*="robot" i]',
+        '#captcha-verify-image',
+        '.captcha_verify_container',
+        '[class*="captcha_verify"]',
     ]
+
     for selector in selectors:
         try:
             locator = page.locator(selector).first
@@ -1045,15 +1049,34 @@ def _verification_modal_visible(page):
                 return True
         except Exception:
             continue
+
+    text_selectors = [
+        'text=/Verify that you.*not a robot/i',
+        'text=/Verify to continue/i',
+        'text=/Security verification/i',
+    ]
+    for selector in text_selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0 and locator.is_visible():
+                return True
+        except Exception:
+            continue
+
     return False
 
 
-def _wait_for_manual_verification(page, headless, suppressprint=False, timeout_seconds=300):
-    """Handle TikTok human verification without attempting to bypass it.
+def _wait_for_manual_verification(
+    page,
+    headless,
+    suppressprint=False,
+    timeout_seconds=300,
+    settle_seconds=3.0,
+):
+    """Wait for TikTok human verification to be completed manually.
 
-    In headless mode the verification cannot be completed interactively, so fail
-    immediately with a clear message. In visible mode, wait for the user to
-    complete the challenge manually and continue once the modal disappears.
+    TikTok can immediately replace one challenge with another. Therefore the
+    challenge must stay absent continuously for a few seconds before resuming.
     """
     if not _verification_modal_visible(page):
         return
@@ -1061,27 +1084,48 @@ def _wait_for_manual_verification(page, headless, suppressprint=False, timeout_s
     if headless:
         raise TikTokUploadError(
             "TIKTOK HUMAN VERIFICATION DETECTED. Re-run this account with "
-            "headless=False, complete the verification manually in the browser, "
-            "and the upload will continue automatically."
+            "headless=False and complete the verification manually."
         )
 
     if not suppressprint:
         print(
-            "TikTok human verification detected. Complete it manually in the "
-            "browser; upload will continue automatically."
+            "TikTok human verification detected. Complete every challenge "
+            "manually in the browser. The upload will resume automatically."
         )
 
     deadline = time.time() + timeout_seconds
+    clear_since = None
+
     while time.time() < deadline:
-        if not _verification_modal_visible(page):
-            time.sleep(0.5)
-            if not suppressprint:
-                print("Verification completed, continuing upload...")
-            return
-        time.sleep(0.5)
+        if _verification_modal_visible(page):
+            clear_since = None
+        else:
+            if clear_since is None:
+                clear_since = time.time()
+            elif time.time() - clear_since >= settle_seconds:
+                if not suppressprint:
+                    print("Verification completed and stable, continuing upload...")
+                return
+
+        time.sleep(0.25)
 
     raise TikTokUploadError(
         "TIKTOK HUMAN VERIFICATION WAS NOT COMPLETED WITHIN 5 MINUTES."
+    )
+
+
+def _verification_checkpoint(page, headless, suppressprint=False, stage=""):
+    """Pause an upload whenever TikTok injects human verification."""
+    if not _verification_modal_visible(page):
+        return
+
+    if not suppressprint and stage:
+        print(f"Verification checkpoint: {stage}")
+
+    _wait_for_manual_verification(
+        page,
+        headless=headless,
+        suppressprint=suppressprint,
     )
 
 
@@ -1682,15 +1726,57 @@ def upload_tiktok(
 
         captcha = _wait_for_upload_or_captcha(page)
         if captcha:
-            _solve_captcha_if_needed(page, suppressprint)
+            _wait_for_manual_verification(
+                page,
+                headless=headless,
+                suppressprint=suppressprint,
+            )
 
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="before video selection",
+        )
         _set_video_input(page, video)
-        _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint, headless=headless)
+
+        time.sleep(0.75)
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="after video selection",
+        )
+
+        _add_description_and_hashtags(
+            page,
+            sim,
+            video,
+            description,
+            hashtags,
+            stealth,
+            suppressprint,
+            headless=headless,
+        )
+
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="after caption",
+        )
         _wait_for_upload_ready(page)
 
         time.sleep(0.2)
         if not suppressprint:
             print("Tik tok done loading file onto servers")
+
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="after TikTok processed the video",
+        )
 
         if visibility and visibility.lower() != "everyone":
             _set_visibility(page, visibility, suppressprint)
@@ -1700,6 +1786,13 @@ def upload_tiktok(
         schedule, day = _normalize_schedule_and_day(schedule, day)
         _validate_schedule_request(schedule, day)
         _apply_schedule(page, schedule, day, stealth, suppressprint)
+
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="before adding sound",
+        )
 
         sound_fail = _add_sound_from_upload_page(
             page,
@@ -1720,6 +1813,13 @@ def upload_tiktok(
             if cover_image:
                 _select_cover_last_frame(page)
                 time.sleep(0.5)
+
+            _verification_checkpoint(
+                page,
+                headless=headless,
+                suppressprint=suppressprint,
+                stage="before publishing",
+            )
 
             result = _submit_upload(
                 page,
