@@ -349,32 +349,88 @@ def validate_proxy(proxy):
         raise ValueError(f"Invalid proxy configuration when trying to simple request: {e}")
 
 
-def _make_stealth_context(p, headless, proxy):
-    stealth = Stealth(
-        navigator_languages_override=("en-US", "en"),
+def _profile_dir(accountname):
+    safe_account = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_"
+        for ch in str(accountname)
     )
+    return os.path.abspath(os.path.join(".tiktok_profiles", safe_account))
+
+
+def _profile_ready_marker(accountname):
+    return os.path.join(_profile_dir(accountname), ".profile_ready")
+
+
+def _profile_is_ready(accountname):
+    return os.path.isfile(_profile_ready_marker(accountname))
+
+
+def _mark_profile_ready(accountname):
+    profile_dir = _profile_dir(accountname)
+    os.makedirs(profile_dir, exist_ok=True)
+    with open(_profile_ready_marker(accountname), "w", encoding="utf-8") as marker_file:
+        marker_file.write("ready\n")
+
+
+def _make_stealth_context(p, headless, proxy, accountname=None):
+    """Create a stable browser context for TikTok.
+
+    For account uploads we use a persistent per-account Chrome profile. This keeps
+    TikTok device/session storage stable between runs instead of creating a fresh
+    browser fingerprint every time and only injecting cookies.
+
+    We deliberately do not spoof a fixed Chrome version or timezone here. The
+    browser reports its real values, which avoids obvious mismatches such as a
+    modern Chromium binary claiming to be Chrome 124 in America/New_York.
+    """
+    stealth = Stealth()
+
+    launch_args = [
+        "--no-sandbox",
+        "--disable-infobars",
+        "--disable-dev-shm-usage",
+    ]
+
+    if accountname:
+        profile_dir = _profile_dir(accountname)
+        os.makedirs(profile_dir, exist_ok=True)
+
+        persistent_kwargs = {
+            "user_data_dir": profile_dir,
+            "headless": headless,
+            "proxy": proxy,
+            "args": launch_args,
+            "viewport": {"width": 1280, "height": 900},
+        }
+
+        # Prefer the user's installed Chrome. It tends to behave more reliably
+        # with TikTok's human-verification widget than an isolated bundled build.
+        try:
+            context = p.chromium.launch_persistent_context(
+                channel="chrome",
+                **persistent_kwargs,
+            )
+        except Exception as chrome_error:
+            print(
+                "Installed Chrome could not be used; falling back to bundled "
+                f"Chromium ({chrome_error})"
+            )
+            context = p.chromium.launch_persistent_context(
+                **persistent_kwargs,
+            )
+
+        # Keep the persistent Chrome profile as close to a normal user browser
+        # as possible. Do not patch navigator/browser properties here.
+        return context.browser, context
 
     browser = p.chromium.launch(
         headless=headless,
         proxy=proxy,
-        args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-            "--disable-infobars",
-            "--disable-dev-shm-usage",
-        ],
+        args=launch_args,
     )
     context = browser.new_context(
         viewport={"width": 1280, "height": 900},
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        locale="en-US",
-        timezone_id="America/New_York",
     )
-
     stealth.apply_stealth_sync(context)
     return browser, context
 
@@ -842,16 +898,61 @@ def _find_caption_box(page, timeout_seconds=120):
 
 
 def _dismiss_upload_tutorials(page, suppressprint=False):
-    for label in ("Cancel", "Got it"):
-        try:
-            button = page.locator(f'button:has-text("{label}")').first
-            if button.count() > 0 and button.is_visible():
+    """Dismiss TikTok Studio tutorial/onboarding pop-ups without touching CAPTCHA.
+
+    TikTok can mount its human-verification challenge inside the same floating-ui
+    portal used by tutorials. Never press Escape or force-click tutorial controls
+    while that verification modal is visible.
+    """
+    labels = ("Cancel", "Got it", "Not now", "Skip", "Maybe later")
+
+    for _ in range(3):
+        if _verification_modal_visible(page):
+            return
+
+        found_any = False
+
+        for label in labels:
+            if _verification_modal_visible(page):
+                return
+
+            try:
+                button = page.locator(f'button:has-text("{label}")').first
+                if button.count() == 0 or not button.is_visible():
+                    continue
+
+                found_any = True
                 if not suppressprint:
-                    print(f"Tutorial pop-up detected, clicking '{label}'")
-                button.click()
-                time.sleep(0.2)
+                    print(f"Tutorial pop-up detected, dismissing '{label}'...")
+
+                try:
+                    button.click(timeout=1500)
+                except Exception:
+                    try:
+                        button.click(timeout=1500, force=True)
+                    except Exception:
+                        try:
+                            button.evaluate("(el) => el.click()")
+                        except Exception:
+                            continue
+
+                time.sleep(0.25)
+            except Exception:
+                continue
+
+        if not found_any:
+            break
+
+        time.sleep(0.25)
+
+    # Only use Escape for transient tutorial overlays. Never send it while
+    # TikTok's human-verification modal is present.
+    if not _verification_modal_visible(page):
+        try:
+            page.keyboard.press("Escape")
+            time.sleep(0.1)
         except Exception:
-            continue
+            pass
 
 
 def _add_photo_description_and_hashtags(
@@ -986,18 +1087,144 @@ def _submit_photo_upload(page, stealth, suppressprint):
     return None if submitted else "Error"
 
 
-def _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint):
-    page.wait_for_selector('div[data-contents="true"]')
+def _verification_modal_visible(page):
+    """Return True only for TikTok's actual human-verification challenge."""
+    selectors = [
+        'img[alt*="Verify that you" i]',
+        'img[alt*="not a robot" i]',
+        '[data-floating-ui-portal] img[alt*="robot" i]',
+        '#captcha-verify-image',
+        '.captcha_verify_container',
+        '[class*="captcha_verify"]',
+    ]
 
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0 and locator.is_visible():
+                return True
+        except Exception:
+            continue
+
+    text_selectors = [
+        'text=/Verify that you.*not a robot/i',
+        'text=/Verify to continue/i',
+        'text=/Security verification/i',
+    ]
+    for selector in text_selectors:
+        try:
+            locator = page.locator(selector).first
+            if locator.count() > 0 and locator.is_visible():
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
+def _wait_for_manual_verification(
+    page,
+    headless,
+    suppressprint=False,
+    timeout_seconds=300,
+    settle_seconds=3.0,
+):
+    """Wait for TikTok human verification to be completed manually.
+
+    TikTok can immediately replace one challenge with another. Therefore the
+    challenge must stay absent continuously for a few seconds before resuming.
+    """
+    if not _verification_modal_visible(page):
+        return
+
+    if headless:
+        raise TikTokUploadError(
+            "TIKTOK HUMAN VERIFICATION DETECTED. Re-run this account with "
+            "headless=False and complete the verification manually."
+        )
+
+    if not suppressprint:
+        print(
+            "TikTok human verification detected. Complete every challenge "
+            "manually in the browser. The upload will resume automatically."
+        )
+
+    deadline = time.time() + timeout_seconds
+    clear_since = None
+
+    while time.time() < deadline:
+        if _verification_modal_visible(page):
+            clear_since = None
+        else:
+            if clear_since is None:
+                clear_since = time.time()
+            elif time.time() - clear_since >= settle_seconds:
+                if not suppressprint:
+                    print("Verification completed and stable, continuing upload...")
+                return
+
+        time.sleep(0.25)
+
+    raise TikTokUploadError(
+        "TIKTOK HUMAN VERIFICATION WAS NOT COMPLETED WITHIN 5 MINUTES."
+    )
+
+
+def _verification_checkpoint(page, headless, suppressprint=False, stage=""):
+    """Pause an upload whenever TikTok injects human verification."""
+    if not _verification_modal_visible(page):
+        return
+
+    if not suppressprint and stage:
+        print(f"Verification checkpoint: {stage}")
+
+    _wait_for_manual_verification(
+        page,
+        headless=headless,
+        suppressprint=suppressprint,
+    )
+
+
+def _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint, headless=True):
+    _verification_checkpoint(
+        page,
+        headless=headless,
+        suppressprint=suppressprint,
+        stage="before caption editor",
+    )
+
+    page.wait_for_selector('div[data-contents="true"]')
     time.sleep(0.5)
-    if page.locator("button:has-text('Cancel')").is_visible():
-        print("Tutorial pop-up detected, dismissing...")
-        page.click("button:has-text('Cancel')")
-    if page.locator("button:has-text('Got it')").is_visible():
-        page.click("button:has-text('Got it')")
+
+    # TikTok may show verification either before or immediately after its
+    # tutorial overlays. Check both sides and never dismiss the challenge.
+    _wait_for_manual_verification(
+        page,
+        headless=headless,
+        suppressprint=suppressprint,
+    )
+    _dismiss_upload_tutorials(page, suppressprint=suppressprint)
+    _wait_for_manual_verification(
+        page,
+        headless=headless,
+        suppressprint=suppressprint,
+    )
 
     desc_box = page.locator('div[data-contents="true"]')
-    sim.click(desc_box)
+    try:
+        sim.click(desc_box)
+    except Exception:
+        # A verification challenge can appear in the tiny gap between the
+        # checkpoint above and the actual click. Handle that race and retry once.
+        if _verification_modal_visible(page):
+            _wait_for_manual_verification(
+                page,
+                headless=headless,
+                suppressprint=suppressprint,
+            )
+            sim.click(desc_box)
+        else:
+            raise
 
     if not suppressprint:
         print(
@@ -1042,19 +1269,42 @@ def _add_description_and_hashtags(page, sim, video, description, hashtags, steal
         print("Description and Hashtags added")
 
 
-def _wait_for_upload_ready(page):
-    content_check_btn = page.locator(
-        "div.common-modal-footer > button[data-type='neutral']", has_text="Cancel"
-    )
-    if content_check_btn.is_visible():
-        content_check_btn.click()
-
+def _wait_for_upload_ready(page, headless=True, suppressprint=False):
+    """Wait for TikTok to finish processing while watching for verification."""
     try:
-        page.wait_for_selector('button:has-text("Post")[aria-disabled="false"]', timeout=12000000)
-    except Exception:
-        raise TikTokUploadError(
-            "ERROR: TIK TOK TOOK TOO LONG TO UPLOAD YOUR FILE (>20min). Try again, if issue persists then try a lower file size or different wifi connection"
+        content_check_btn = page.locator(
+            "div.common-modal-footer > button[data-type='neutral']", has_text="Cancel"
         )
+        if content_check_btn.is_visible() and not _verification_modal_visible(page):
+            content_check_btn.click(timeout=1500)
+    except Exception:
+        pass
+
+    deadline = time.time() + 1200
+    post_selector = 'button:has-text("Post")[aria-disabled="false"]'
+
+    while time.time() < deadline:
+        if _verification_modal_visible(page):
+            _wait_for_manual_verification(
+                page,
+                headless=headless,
+                suppressprint=suppressprint,
+            )
+            continue
+
+        try:
+            post_button = page.locator(post_selector).first
+            if post_button.count() > 0 and post_button.is_visible():
+                return
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    raise TikTokUploadError(
+        "ERROR: TIK TOK TOOK TOO LONG TO UPLOAD YOUR FILE (>20min). "
+        "Try again, or use a smaller file / different connection."
+    )
 
 
 def _validate_schedule_request(schedule, day):
@@ -1557,11 +1807,18 @@ def upload_tiktok(
     if accountname is None:
         raise TikTokUploadError("PLEASE ENTER NAME OF ACCOUNT TO POST ON, READ DOCUMENTATION FOR MORE INFO")
 
-    cookies = _load_or_create_cookies(accountname, proxy)
+    use_browser_profile = _profile_is_ready(accountname)
+    cookies = None if use_browser_profile else _load_or_create_cookies(accountname, proxy)
 
     with sync_playwright() as p:
-        _, context = _make_stealth_context(p, headless=headless, proxy=proxy)
-        context.add_cookies(cookies)
+        _, context = _make_stealth_context(
+            p,
+            headless=headless,
+            proxy=proxy,
+            accountname=accountname,
+        )
+        if cookies:
+            context.add_cookies(cookies)
         page = context.new_page()
 
         sim = SyncUserSimulator(page)
@@ -1574,15 +1831,61 @@ def upload_tiktok(
 
         captcha = _wait_for_upload_or_captcha(page)
         if captcha:
-            _solve_captcha_if_needed(page, suppressprint)
+            _wait_for_manual_verification(
+                page,
+                headless=headless,
+                suppressprint=suppressprint,
+            )
 
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="before video selection",
+        )
         _set_video_input(page, video)
-        _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint)
-        _wait_for_upload_ready(page)
+
+        time.sleep(0.75)
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="after video selection",
+        )
+
+        _add_description_and_hashtags(
+            page,
+            sim,
+            video,
+            description,
+            hashtags,
+            stealth,
+            suppressprint,
+            headless=headless,
+        )
+
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="after caption",
+        )
+        _wait_for_upload_ready(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+        )
 
         time.sleep(0.2)
         if not suppressprint:
             print("Tik tok done loading file onto servers")
+
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="after TikTok processed the video",
+        )
 
         if visibility and visibility.lower() != "everyone":
             _set_visibility(page, visibility, suppressprint)
@@ -1592,6 +1895,13 @@ def upload_tiktok(
         schedule, day = _normalize_schedule_and_day(schedule, day)
         _validate_schedule_request(schedule, day)
         _apply_schedule(page, schedule, day, stealth, suppressprint)
+
+        _verification_checkpoint(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+            stage="before adding sound",
+        )
 
         sound_fail = _add_sound_from_upload_page(
             page,
@@ -1612,6 +1922,13 @@ def upload_tiktok(
             if cover_image:
                 _select_cover_last_frame(page)
                 time.sleep(0.5)
+
+            _verification_checkpoint(
+                page,
+                headless=headless,
+                suppressprint=suppressprint,
+                stage="before publishing",
+            )
 
             result = _submit_upload(
                 page,
@@ -1636,6 +1953,74 @@ def upload_tiktok(
 
 
     return "Completed"
+
+
+def login_tiktok_browser_profile(accountname: str, *, proxy=None, timeout_seconds=600) -> str:
+    """Log in manually inside the persistent Chrome profile for an account.
+
+    This is the preferred login method for accounts that trigger TikTok human
+    verification. It keeps cookies, localStorage, IndexedDB and device/session
+    state together in one normal Chrome profile instead of importing cookie JSON
+    into a fresh browser context.
+    """
+    if not accountname:
+        raise TikTokUploadError("PLEASE ENTER NAME OF ACCOUNT TO LOG IN")
+
+    validate_proxy(proxy)
+
+    with sync_playwright() as p:
+        _, context = _make_stealth_context(
+            p,
+            headless=False,
+            proxy=proxy,
+            accountname=accountname,
+        )
+
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.goto("https://www.tiktok.com/login", timeout=60000)
+        except Exception:
+            page.goto("https://www.tiktok.com/", timeout=60000)
+
+        print(
+            f"Chrome profile login for '{accountname}' opened. "
+            "Log in to TikTok manually and complete any verification. "
+            "This window will close automatically when the session is detected."
+        )
+
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                cookies = context.cookies("https://www.tiktok.com")
+                cookie_names = {cookie.get("name") for cookie in cookies}
+                has_session = bool(
+                    {"sessionid", "sessionid_ss", "sid_tt"} & cookie_names
+                )
+
+                if has_session:
+                    # Give TikTok a moment to finish writing profile storage.
+                    time.sleep(3)
+                    _mark_profile_ready(accountname)
+                    profile_dir = _profile_dir(accountname)
+                    print(
+                        f"Account '{accountname}' browser profile is ready: "
+                        f"{profile_dir}"
+                    )
+                    context.close()
+                    return profile_dir
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        try:
+            context.close()
+        except Exception:
+            pass
+
+    raise TikTokUploadError(
+        "LOGIN TIMEOUT: TikTok session was not detected within 10 minutes."
+    )
 
 
 def login_tiktok_account(accountname: str, *, proxy=None) -> str:
@@ -1694,11 +2079,18 @@ def upload_tiktok_photos(
             "PLEASE ENTER NAME OF ACCOUNT TO POST ON, READ DOCUMENTATION FOR MORE INFO"
         )
 
-    cookies = _load_or_create_cookies(accountname, proxy)
+    use_browser_profile = _profile_is_ready(accountname)
+    cookies = None if use_browser_profile else _load_or_create_cookies(accountname, proxy)
 
     with sync_playwright() as p:
-        _, context = _make_stealth_context(p, headless=headless, proxy=proxy)
-        context.add_cookies(cookies)
+        _, context = _make_stealth_context(
+            p,
+            headless=headless,
+            proxy=proxy,
+            accountname=accountname,
+        )
+        if cookies:
+            context.add_cookies(cookies)
         page = context.new_page()
         sim = SyncUserSimulator(page)
 
