@@ -71,3 +71,23 @@ py photo_uploader.py photos .\photos --accounts acc1 acc2 acc3 acc4 acc5 acc6 ac
 2. удали только TK_cookies_accN.json для проблемного аккаунта;
 3. py photo_uploader.py login accN
 4. снова запусти только этот аккаунт с --visible-browser.
+
+
+НОВЫЙ FIX ДЛЯ БЕСКОНЕЧНО ПЕРЕЗАГРУЖАЮЩЕЙСЯ VERIFICATION
+=========================================================
+Теперь каждый аккаунт использует постоянный браузерный профиль:
+.tiktok_profiles\acc1
+.tiktok_profiles\acc2
+...
+
+Используется установленный Google Chrome без поддельного Chrome/124 и без
+жёсткой таймзоны America/New_York. Это сохраняет device/session storage TikTok
+между запусками и уменьшает пересоздание verification challenge.
+
+Для первого теста запускай только проблемный аккаунт:
+py photo_uploader.py video .\video.mp4 --accounts acc6 --caption "релиз в тг t.me/donutgram" --hashtags iphone ayugram рек ayugramios --sound "ДИНАСТИЯ - VILLIAN & madk1d" --sound-volume mix --visible-browser
+
+Если раньше уже запускал эту новую persistent-profile версию и профиль acc6
+получился сломанным, закрой все окна Chrome, удали только:
+.tiktok_profiles\acc6
+и запусти acc6 ещё раз. Cookie-файл TK_cookies_acc6.json оставь.
