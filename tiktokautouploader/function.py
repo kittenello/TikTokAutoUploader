@@ -1130,8 +1130,14 @@ def _verification_checkpoint(page, headless, suppressprint=False, stage=""):
 
 
 def _add_description_and_hashtags(page, sim, video, description, hashtags, stealth, suppressprint, headless=True):
-    page.wait_for_selector('div[data-contents="true"]')
+    _verification_checkpoint(
+        page,
+        headless=headless,
+        suppressprint=suppressprint,
+        stage="before caption editor",
+    )
 
+    page.wait_for_selector('div[data-contents="true"]')
     time.sleep(0.5)
 
     # TikTok may show verification either before or immediately after its
@@ -1149,7 +1155,20 @@ def _add_description_and_hashtags(page, sim, video, description, hashtags, steal
     )
 
     desc_box = page.locator('div[data-contents="true"]')
-    sim.click(desc_box)
+    try:
+        sim.click(desc_box)
+    except Exception:
+        # A verification challenge can appear in the tiny gap between the
+        # checkpoint above and the actual click. Handle that race and retry once.
+        if _verification_modal_visible(page):
+            _wait_for_manual_verification(
+                page,
+                headless=headless,
+                suppressprint=suppressprint,
+            )
+            sim.click(desc_box)
+        else:
+            raise
 
     if not suppressprint:
         print(
@@ -1194,19 +1213,42 @@ def _add_description_and_hashtags(page, sim, video, description, hashtags, steal
         print("Description and Hashtags added")
 
 
-def _wait_for_upload_ready(page):
-    content_check_btn = page.locator(
-        "div.common-modal-footer > button[data-type='neutral']", has_text="Cancel"
-    )
-    if content_check_btn.is_visible():
-        content_check_btn.click()
-
+def _wait_for_upload_ready(page, headless=True, suppressprint=False):
+    """Wait for TikTok to finish processing while watching for verification."""
     try:
-        page.wait_for_selector('button:has-text("Post")[aria-disabled="false"]', timeout=12000000)
-    except Exception:
-        raise TikTokUploadError(
-            "ERROR: TIK TOK TOOK TOO LONG TO UPLOAD YOUR FILE (>20min). Try again, if issue persists then try a lower file size or different wifi connection"
+        content_check_btn = page.locator(
+            "div.common-modal-footer > button[data-type='neutral']", has_text="Cancel"
         )
+        if content_check_btn.is_visible() and not _verification_modal_visible(page):
+            content_check_btn.click(timeout=1500)
+    except Exception:
+        pass
+
+    deadline = time.time() + 1200
+    post_selector = 'button:has-text("Post")[aria-disabled="false"]'
+
+    while time.time() < deadline:
+        if _verification_modal_visible(page):
+            _wait_for_manual_verification(
+                page,
+                headless=headless,
+                suppressprint=suppressprint,
+            )
+            continue
+
+        try:
+            post_button = page.locator(post_selector).first
+            if post_button.count() > 0 and post_button.is_visible():
+                return
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+
+    raise TikTokUploadError(
+        "ERROR: TIK TOK TOOK TOO LONG TO UPLOAD YOUR FILE (>20min). "
+        "Try again, or use a smaller file / different connection."
+    )
 
 
 def _validate_schedule_request(schedule, day):
@@ -1765,7 +1807,11 @@ def upload_tiktok(
             suppressprint=suppressprint,
             stage="after caption",
         )
-        _wait_for_upload_ready(page)
+        _wait_for_upload_ready(
+            page,
+            headless=headless,
+            suppressprint=suppressprint,
+        )
 
         time.sleep(0.2)
         if not suppressprint:
