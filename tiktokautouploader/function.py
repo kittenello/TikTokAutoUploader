@@ -349,6 +349,29 @@ def validate_proxy(proxy):
         raise ValueError(f"Invalid proxy configuration when trying to simple request: {e}")
 
 
+def _profile_dir(accountname):
+    safe_account = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_"
+        for ch in str(accountname)
+    )
+    return os.path.abspath(os.path.join(".tiktok_profiles", safe_account))
+
+
+def _profile_ready_marker(accountname):
+    return os.path.join(_profile_dir(accountname), ".profile_ready")
+
+
+def _profile_is_ready(accountname):
+    return os.path.isfile(_profile_ready_marker(accountname))
+
+
+def _mark_profile_ready(accountname):
+    profile_dir = _profile_dir(accountname)
+    os.makedirs(profile_dir, exist_ok=True)
+    with open(_profile_ready_marker(accountname), "w", encoding="utf-8") as marker_file:
+        marker_file.write("ready\n")
+
+
 def _make_stealth_context(p, headless, proxy, accountname=None):
     """Create a stable browser context for TikTok.
 
@@ -369,13 +392,7 @@ def _make_stealth_context(p, headless, proxy, accountname=None):
     ]
 
     if accountname:
-        safe_account = "".join(
-            ch if ch.isalnum() or ch in ("-", "_") else "_"
-            for ch in str(accountname)
-        )
-        profile_dir = os.path.abspath(
-            os.path.join(".tiktok_profiles", safe_account)
-        )
+        profile_dir = _profile_dir(accountname)
         os.makedirs(profile_dir, exist_ok=True)
 
         persistent_kwargs = {
@@ -402,7 +419,8 @@ def _make_stealth_context(p, headless, proxy, accountname=None):
                 **persistent_kwargs,
             )
 
-        stealth.apply_stealth_sync(context)
+        # Keep the persistent Chrome profile as close to a normal user browser
+        # as possible. Do not patch navigator/browser properties here.
         return context.browser, context
 
     browser = p.chromium.launch(
@@ -1789,7 +1807,8 @@ def upload_tiktok(
     if accountname is None:
         raise TikTokUploadError("PLEASE ENTER NAME OF ACCOUNT TO POST ON, READ DOCUMENTATION FOR MORE INFO")
 
-    cookies = _load_or_create_cookies(accountname, proxy)
+    use_browser_profile = _profile_is_ready(accountname)
+    cookies = None if use_browser_profile else _load_or_create_cookies(accountname, proxy)
 
     with sync_playwright() as p:
         _, context = _make_stealth_context(
@@ -1798,7 +1817,8 @@ def upload_tiktok(
             proxy=proxy,
             accountname=accountname,
         )
-        context.add_cookies(cookies)
+        if cookies:
+            context.add_cookies(cookies)
         page = context.new_page()
 
         sim = SyncUserSimulator(page)
@@ -1935,6 +1955,74 @@ def upload_tiktok(
     return "Completed"
 
 
+def login_tiktok_browser_profile(accountname: str, *, proxy=None, timeout_seconds=600) -> str:
+    """Log in manually inside the persistent Chrome profile for an account.
+
+    This is the preferred login method for accounts that trigger TikTok human
+    verification. It keeps cookies, localStorage, IndexedDB and device/session
+    state together in one normal Chrome profile instead of importing cookie JSON
+    into a fresh browser context.
+    """
+    if not accountname:
+        raise TikTokUploadError("PLEASE ENTER NAME OF ACCOUNT TO LOG IN")
+
+    validate_proxy(proxy)
+
+    with sync_playwright() as p:
+        _, context = _make_stealth_context(
+            p,
+            headless=False,
+            proxy=proxy,
+            accountname=accountname,
+        )
+
+        page = context.pages[0] if context.pages else context.new_page()
+        try:
+            page.goto("https://www.tiktok.com/login", timeout=60000)
+        except Exception:
+            page.goto("https://www.tiktok.com/", timeout=60000)
+
+        print(
+            f"Chrome profile login for '{accountname}' opened. "
+            "Log in to TikTok manually and complete any verification. "
+            "This window will close automatically when the session is detected."
+        )
+
+        deadline = time.time() + timeout_seconds
+        while time.time() < deadline:
+            try:
+                cookies = context.cookies("https://www.tiktok.com")
+                cookie_names = {cookie.get("name") for cookie in cookies}
+                has_session = bool(
+                    {"sessionid", "sessionid_ss", "sid_tt"} & cookie_names
+                )
+
+                if has_session:
+                    # Give TikTok a moment to finish writing profile storage.
+                    time.sleep(3)
+                    _mark_profile_ready(accountname)
+                    profile_dir = _profile_dir(accountname)
+                    print(
+                        f"Account '{accountname}' browser profile is ready: "
+                        f"{profile_dir}"
+                    )
+                    context.close()
+                    return profile_dir
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        try:
+            context.close()
+        except Exception:
+            pass
+
+    raise TikTokUploadError(
+        "LOGIN TIMEOUT: TikTok session was not detected within 10 minutes."
+    )
+
+
 def login_tiktok_account(accountname: str, *, proxy=None) -> str:
     """Create or refresh the saved cookie file for one TikTok account.
 
@@ -1991,7 +2079,8 @@ def upload_tiktok_photos(
             "PLEASE ENTER NAME OF ACCOUNT TO POST ON, READ DOCUMENTATION FOR MORE INFO"
         )
 
-    cookies = _load_or_create_cookies(accountname, proxy)
+    use_browser_profile = _profile_is_ready(accountname)
+    cookies = None if use_browser_profile else _load_or_create_cookies(accountname, proxy)
 
     with sync_playwright() as p:
         _, context = _make_stealth_context(
@@ -2000,7 +2089,8 @@ def upload_tiktok_photos(
             proxy=proxy,
             accountname=accountname,
         )
-        context.add_cookies(cookies)
+        if cookies:
+            context.add_cookies(cookies)
         page = context.new_page()
         sim = SyncUserSimulator(page)
 
