@@ -1,8 +1,9 @@
-"""Small Windows-friendly CLI for TikTok photo carousels.
+"""Small Windows-friendly CLI for TikTok uploads.
 
 Examples:
     python photo_uploader.py login main backup
     python photo_uploader.py photos ./photos --accounts main backup --caption "hello"
+    python photo_uploader.py video ./video.mp4 --accounts main backup --caption "hello" --visible-browser
 """
 
 import argparse
@@ -10,7 +11,9 @@ import re
 from pathlib import Path
 
 from tiktokautouploader import (
+    TikTokUploadError,
     login_tiktok_account,
+    upload_tiktok,
     upload_tiktok_photos_multi,
 )
 
@@ -68,6 +71,38 @@ def cmd_photos(args):
         print(f"{account}: {result}")
 
 
+def cmd_video(args):
+    video = str(Path(args.video).expanduser().resolve())
+    if not Path(video).is_file():
+        raise SystemExit(f"Video file not found: {video}")
+
+    hashtags = args.hashtags or None
+    results = {}
+
+    for account in args.accounts:
+        print(f"\n=== Upload video: {account} ===")
+        try:
+            results[account] = upload_tiktok(
+                video=video,
+                description=args.caption,
+                accountname=account,
+                hashtags=hashtags,
+                sound_name=args.sound,
+                sound_aud_vol=args.sound_volume,
+                headless=not args.visible_browser,
+                stealth=args.stealth,
+                search_mode=args.sound_mode,
+                visibility=args.visibility,
+            )
+        except Exception as exc:
+            results[account] = f"Error: {exc}"
+            print(f"Upload failed for '{account}': {exc}")
+
+    print("\n=== Results ===")
+    for account, result in results.items():
+        print(f"{account}: {result}")
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Login TikTok accounts and upload the same photo carousel to multiple accounts."
@@ -104,6 +139,46 @@ def build_parser():
         help="Use extra human-like delays provided by the library.",
     )
     photos.set_defaults(func=cmd_photos)
+
+    video = sub.add_parser("video", help="Upload one video to one or more saved accounts.")
+    video.add_argument("video", help="Path to the video file, e.g. ./video.mp4")
+    video.add_argument("--accounts", nargs="+", required=True, help="Saved account labels.")
+    video.add_argument("--caption", default="", help="Post caption.")
+    video.add_argument(
+        "--hashtags",
+        nargs="*",
+        default=None,
+        help="Hashtags with or without #.",
+    )
+    video.add_argument("--sound", default=None, help="TikTok sound name to search for.")
+    video.add_argument(
+        "--sound-volume",
+        choices=["mix", "main", "background"],
+        default="mix",
+        help="TikTok sound/original audio mix.",
+    )
+    video.add_argument(
+        "--sound-mode",
+        choices=["search", "favorites"],
+        default="search",
+        help="Find the TikTok sound via search or Favorites.",
+    )
+    video.add_argument(
+        "--visibility",
+        choices=["everyone", "friends", "private"],
+        default="everyone",
+    )
+    video.add_argument(
+        "--visible-browser",
+        action="store_true",
+        help="Show Chromium. Required if TikTok asks for human verification.",
+    )
+    video.add_argument(
+        "--stealth",
+        action="store_true",
+        help="Use extra human-like delays provided by the library.",
+    )
+    video.set_defaults(func=cmd_video)
     return parser
 
 
